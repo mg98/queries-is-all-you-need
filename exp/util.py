@@ -50,7 +50,7 @@ tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME, legacy=True)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
 def get_input_and_attention_masks(d, train_or_labels = 'train'):
-  tokenized = tokenizer(d.tolist(), padding='max_length', return_tensors="pt", truncation=True,
+  tokenized = tokenizer(d.astype(str).tolist(), padding='max_length', return_tensors="pt", truncation=True,
                         max_length=128 if train_or_labels == 'train' else 8)
   input_ids = tokenized['input_ids'].to('cuda')
   attention_mask = tokenized['attention_mask'].to('cuda')

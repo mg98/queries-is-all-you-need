@@ -125,37 +125,6 @@ artifact.add(
 )
 wandb.run.log_artifact(artifact)
 
-# Compute top-k accuracies
-df = pd.DataFrame(data, columns=['test_input', 'test_output', 'output', 'score'])
-test_cases = df.groupby(['test_input', 'test_output'])
-
-for k in [1, 3, 5, 10]:
-    acc = test_cases.apply(lambda group: (group['test_output'].iloc[0] == group.head(k)['output']).any()).sum()
-    wandb.run.summary[f'top{k}_acc'] = acc / float(test_cases.ngroups)
-
-try:
-    artifact = wandb.use_artifact(f'retrieval_summary:latest')
-    summary_table = artifact.get('retrieval_summary')
-except wandb.errors.CommError:
-    summary_table = wandb.Table(columns=[
-       'n_docids', 'n_queries', 
-       'top1_acc', 'top3_acc', 'top5_acc', 'top10_acc'
-      ])
-
-summary_table.add_data(
-   N_DOCIDS, 
-   N_QUERIES, 
-   wandb.run.summary[f'top1_acc'], 
-   wandb.run.summary[f'top3_acc'], 
-   wandb.run.summary[f'top5_acc'], 
-   wandb.run.summary[f'top10_acc']
-)
-
-# Create or update the artifact with the new table
-artifact = wandb.Artifact('retrieval_summary', type='results')
-artifact.add(summary_table, 'retrieval_summary')
-wandb.log_artifact(artifact)
-
 # Store model state
 if not os.path.exists('models'): os.mkdir('models')
 model_path = f'models/model_{N_DOCIDS}_{N_QUERIES}.pth'

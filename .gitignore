@@ -9,3 +9,5 @@ models/
 !models/.gitkeep
 plots/
 !plots/.gitkeep
+tables/
+!tables/.gitkeep
