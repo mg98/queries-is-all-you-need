@@ -16,32 +16,28 @@ TEST_SPLIT_SIZE = 1
 """## Load and Prepare Dataset"""
 df = get_data(N_DOCIDS, (TRAIN_SPLIT_SIZE+VAL_SPLIT_SIZE+TEST_SPLIT_SIZE)*20)
 
-train_base_df, val_and_test_df = train_test_split(df,
-  train_size=TRAIN_SPLIT_SIZE*20*N_DOCIDS,
-  test_size=(VAL_SPLIT_SIZE+TEST_SPLIT_SIZE)*20*N_DOCIDS, 
-  stratify=df['docid']
-)
-val_df, test_df = train_test_split(val_and_test_df, 
-  train_size=VAL_SPLIT_SIZE*20*N_DOCIDS,
-  test_size=TEST_SPLIT_SIZE*20*N_DOCIDS, 
-  stratify=val_and_test_df['docid']
+train_base_df, val_df, test_df = train_test_val_split(
+  df,
+  TRAIN_SPLIT_SIZE*20*N_DOCIDS,
+  VAL_SPLIT_SIZE*20*N_DOCIDS,
+  TEST_SPLIT_SIZE*20*N_DOCIDS
 )
 
 """## Split & Tokenization"""
 
-val_inputs, val_att = get_input_and_attention_masks(val_df['query'], 'train')
-test_inputs, _ = get_input_and_attention_masks(test_df['query'], 'train')
+val_inputs, val_att = get_input_and_attention_masks(val_df['query'])
+test_inputs, _ = get_input_and_attention_masks(test_df['query'])
 
 # get a sample of n queries of each document for the train set
 train_df = pd.concat([group.head(N_QUERIES) for _, group in train_base_df.groupby('docid')])
 train_df = train_df.sample(frac=1).reset_index(drop=True)
-train_inputs, train_att = get_input_and_attention_masks(train_df['query'], 'train')
-train_labels, _ = get_input_and_attention_masks(train_df['docid'], 'labels')
+train_inputs, train_att = get_input_and_attention_masks(train_df['query'])
+train_labels, _ = get_input_and_attention_masks(train_df['docid'], True)
 
 """## Training"""
 
 wandb.init(
-  project=f"retrieval-{N_DOCIDS}",
+  project=f"retrieval-{N_DOCIDS}sx",
   name=f"{N_QUERIES}",
   config={
    "learning_rate": LEARNING_RATE,
@@ -62,7 +58,9 @@ wandb.define_metric("loss", summary="min")
 early_stopping = EarlyStopping()
 model.train()
 
-for epoch in range(1, 1000):
+epoch = 0
+while True:
+  epoch += 1
 
   # training iteration
   for i in range(0, len(train_inputs), BATCH_SIZE):
@@ -82,7 +80,7 @@ for epoch in range(1, 1000):
   
   with torch.no_grad():
     for i in range(len(val_df)):
-      output = model.generate(val_inputs[i].unsqueeze(0), max_length=8)
+      output = model.generate(val_inputs[i].unsqueeze(0), max_length=28, prefix_allowed_tokens_fn=restrict_decode_vocab)
       if decode(output[0]) == val_df['docid'].iloc[i]:
         matches += 1
 
@@ -92,6 +90,7 @@ for epoch in range(1, 1000):
   early_stopping(val_acc, epoch, model)
   if early_stopping.early_stop:
     model = early_stopping.best_model
+    print('set model to best_model and break', model is None)
     break
   model.train()
 
@@ -107,7 +106,8 @@ with torch.no_grad():
   for i in range(len(test_df)):
     output = model.generate(test_inputs[i].unsqueeze(0),
           do_sample=False, return_dict_in_generate=True, output_scores=True,
-          max_length=8, num_beams=10, num_return_sequences=10)
+          max_length=28, num_beams=10, num_return_sequences=10,
+          prefix_allowed_tokens_fn=restrict_decode_vocab)
 
     docids = [decode(output_id) for output_id in output.sequences]
     scores = output.sequences_scores.cpu().detach().numpy()
@@ -124,6 +124,37 @@ artifact.add(
   table_name
 )
 wandb.run.log_artifact(artifact)
+
+# Compute top-k accuracies
+df = pd.DataFrame(data, columns=['test_input', 'test_output', 'output', 'score'])
+test_cases = df.groupby(['test_input', 'test_output'])
+
+for k in [1, 3, 5, 10]:
+    acc = test_cases.apply(lambda group: (group['test_output'].iloc[0] == group.head(k)['output']).any()).sum()
+    wandb.run.summary[f'top{k}_acc'] = acc / float(test_cases.ngroups)
+
+try:
+    artifact = wandb.use_artifact(f'retrieval_summary:latest')
+    summary_table = artifact.get('retrieval_summary')
+except wandb.errors.CommError:
+    summary_table = wandb.Table(columns=[
+       'n_docids', 'n_queries', 
+       'top1_acc', 'top3_acc', 'top5_acc', 'top10_acc'
+      ])
+
+summary_table.add_data(
+   N_DOCIDS, 
+   N_QUERIES, 
+   wandb.run.summary[f'top1_acc'], 
+   wandb.run.summary[f'top3_acc'], 
+   wandb.run.summary[f'top5_acc'], 
+   wandb.run.summary[f'top10_acc']
+)
+
+# Create or update the artifact with the new table
+artifact = wandb.Artifact('retrieval_summary', type='results')
+artifact.add(summary_table, 'retrieval_summary')
+wandb.log_artifact(artifact)
 
 # Store model state
 if not os.path.exists('models'): os.mkdir('models')

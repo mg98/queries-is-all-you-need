@@ -6,7 +6,7 @@ from util import *
 
 N_DOCIDS = 100
 
-DF = pd.read_csv('orcas.tsv', sep='\t', header=None, names=['query', 'docid'])
+DF = pd.read_csv('orcas.tsv', sep='\t', header=None, names=['query', 'docid']).drop_duplicates()
 
 for X in range(1, 11):
 

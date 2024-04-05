@@ -6,7 +6,7 @@ import wandb
 from util import *
 
 """## Configuration"""
-N_DOCIDS   = 100
+N_DOCIDS = 100
 N_QUERIES = 1
 TRAIN_SPLIT_SIZE = 3
 VAL_SPLIT_SIZE = 1
@@ -34,8 +34,7 @@ wandb.define_metric("acc", summary="max")
 wandb.define_metric("loss", summary="min")
 
 """## Load Dataset"""
-DF = pd.read_csv('orcas.tsv', sep='\t', header=None,
-         names=['query', 'docid'])
+DF = pd.read_csv('orcas.tsv', sep='\t', header=None, names=['query', 'docid']).drop_duplicates()
 
 """## Prepare Dataset"""
 
@@ -44,30 +43,24 @@ df = get_data(N_DOCIDS, N_QUERIES,
         (TRAIN_SPLIT_SIZE+VAL_SPLIT_SIZE+TEST_SPLIT_SIZE)*(X+1)
       )
 
-# Split dataset into train, val, test
-train_base_df, val_and_test_df = train_test_split(df, 
-  train_size=TRAIN_SPLIT_SIZE*N_DOCIDS, 
-  test_size=(VAL_SPLIT_SIZE+TEST_SPLIT_SIZE)*N_DOCIDS, 
-  stratify=df['docid']
-)
-val_df, test_df = train_test_split(val_and_test_df, 
-  train_size=VAL_SPLIT_SIZE*N_DOCIDS,
-  test_size=TEST_SPLIT_SIZE*N_DOCIDS, 
-  stratify=val_and_test_df['docid']
+train_base_df, val_df, test_df = train_test_val_split(
+  TRAIN_SPLIT_SIZE*N_DOCIDS,
+  VAL_SPLIT_SIZE*N_DOCIDS,
+  TEST_SPLIT_SIZE*N_DOCIDS
 )
 
 """## Split & Tokenization"""
 
-val_inputs, val_att = get_input_and_attention_masks(val_df['query'], 'train')
-test_inputs, _ = get_input_and_attention_masks(test_df['query'], 'train')
+val_inputs, val_att = get_input_and_attention_masks(val_df['query'])
+test_inputs, _ = get_input_and_attention_masks(test_df['query'])
 
 n = N_QUERIES
 
 # get a sample of n queries of each document for the train set
 train_df = pd.concat([group.head(n) for _, group in train_base_df.groupby('docid')])
 train_df = train_df.sample(frac=1).reset_index(drop=True)
-train_inputs, train_att = get_input_and_attention_masks(train_df['query'], 'train')
-train_labels, _ = get_input_and_attention_masks(train_df['docid'], 'labels')
+train_inputs, train_att = get_input_and_attention_masks(train_df['query'])
+train_labels, _ = get_input_and_attention_masks(train_df['docid'], True)
 
 """## Training"""
 early_stopping = EarlyStopping()

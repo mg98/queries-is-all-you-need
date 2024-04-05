@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import torch
 from copy import deepcopy
+from sklearn.model_selection import train_test_split
 
 # Ensure deterministic behavior
 torch.backends.cudnn.deterministic = True
@@ -36,7 +37,7 @@ class EarlyStopping:
   def __call__(self, score, epoch, model):
     if score < self.best_score + self.min_delta:
       self.counter += 1
-      if self.counter >= self.patience:
+      if self.counter >= self.patience and self.best_model is not None:
         self.early_stop = True
     else:
       self.best_score = score
@@ -45,13 +46,9 @@ class EarlyStopping:
       self.counter = 0
 
 
-model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to('cuda')
-tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME, legacy=True)
-optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-
-def get_input_and_attention_masks(d, train_or_labels = 'train'):
+def get_input_and_attention_masks(d, is_label = False):
   tokenized = tokenizer(d.astype(str).tolist(), padding='max_length', return_tensors="pt", truncation=True,
-                        max_length=128 if train_or_labels == 'train' else 8)
+                        max_length=8 if is_label else 20)
   input_ids = tokenized['input_ids'].to('cuda')
   attention_mask = tokenized['attention_mask'].to('cuda')
   return input_ids, attention_mask
@@ -59,12 +56,27 @@ def get_input_and_attention_masks(d, train_or_labels = 'train'):
 def decode(x):
  return tokenizer.decode(x, skip_special_tokens=True)
 
-
 # Precompute dataframes
 DF = pd.read_csv('orcas.tsv', sep='\t', header=None,
         names=['query', 'docid'])
 DOCID_COUNTS = DF.groupby('docid').count()
- 
+
+tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME, legacy=True)
+
+tokenized_docids = DF['docid'].apply(tokenizer.tokenize)
+unique_tokens = set([token for sublist in tokenized_docids for token in sublist])
+INT_TOKEN_IDS = [id for token, id in tokenizer.get_vocab().items() if token in unique_tokens]
+INT_TOKEN_IDS.append(tokenizer.eos_token_id)
+MAX_NEW_TOKENS = max(len(tokens) for tokens in unique_tokens)
+del tokenized_docids, unique_tokens
+
+def restrict_decode_vocab(batch_idx, prefix_beam):
+    return INT_TOKEN_IDS
+
+model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to('cuda')
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
 def get_data(n_docs, n_queries_per_docs, filter_from=None, filter_to=None):
   """
   Get data (query-docid pairs) about `n_docs` documents and `n_queries_per_docs` associated queries per document.
@@ -90,3 +102,16 @@ def get_data(n_docs, n_queries_per_docs, filter_from=None, filter_to=None):
   base_df.reset_index(drop=True, inplace=True)
 
   return base_df
+
+def train_test_val_split(df, train_size, val_size, test_size):
+  train_df, val_and_test_df = train_test_split(df,
+    train_size=train_size,
+    test_size=val_size+test_size, 
+    stratify=df['docid']
+  )
+  val_df, test_df = train_test_split(val_and_test_df, 
+    train_size=val_size,
+    test_size=test_size, 
+    stratify=val_and_test_df['docid']
+  )
+  return train_df, val_df, test_df
