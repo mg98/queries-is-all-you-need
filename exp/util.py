@@ -15,7 +15,8 @@ random.seed(0)
 
 MODEL_NAME = 't5-small'
 LEARNING_RATE = 1e-3
-BATCH_SIZE  = 32
+TRAIN_BATCH_SIZE  = 32
+EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE * 2
 
 # Early stopping
 ES_PATIENCE  = 20
@@ -48,7 +49,7 @@ class EarlyStopping:
 
 def get_input_and_attention_masks(d, is_label = False):
   tokenized = tokenizer(d.astype(str).tolist(), padding='max_length', return_tensors="pt", truncation=True,
-                        max_length=8 if is_label else 20)
+                        max_length=8 if is_label else 128)
   input_ids = tokenized['input_ids'].to('cuda')
   attention_mask = tokenized['attention_mask'].to('cuda')
   return input_ids, attention_mask
@@ -115,3 +116,8 @@ def train_test_val_split(df, train_size, val_size, test_size):
     stratify=val_and_test_df['docid']
   )
   return train_df, val_df, test_df
+
+def batched(l, chunk_size):
+    """Splits a list into chunks of a specified size. In Python 3.12, this could be replaced by `itertools.batched`."""
+    l = list(l)
+    return [l[i:i + chunk_size] for i in range(0, len(l), chunk_size)]

@@ -41,7 +41,8 @@ wandb.init(
   name=f"{N_QUERIES}",
   config={
    "learning_rate": LEARNING_RATE,
-   "batch_size": BATCH_SIZE,
+   "train_batch_size": TRAIN_BATCH_SIZE,
+   "eval_batch_size": EVAL_BATCH_SIZE,
    "model": MODEL_NAME,
    "number_of_docs": N_DOCIDS,
    "number_of_queries": N_QUERIES,
@@ -63,28 +64,33 @@ while True:
   epoch += 1
 
   # training iteration
-  for i in range(0, len(train_inputs), BATCH_SIZE):
+  for i in range(0, len(train_inputs), TRAIN_BATCH_SIZE):
     output = model(
-      input_ids=train_inputs[i:i+BATCH_SIZE],
-      attention_mask=train_att[i:i+BATCH_SIZE],
-      labels=train_labels[i:i+BATCH_SIZE]
+      input_ids=train_inputs[i:i+TRAIN_BATCH_SIZE],
+      attention_mask=train_att[i:i+TRAIN_BATCH_SIZE],
+      labels=train_labels[i:i+TRAIN_BATCH_SIZE]
     )
     wandb.log({"loss": output.loss.item()})
     output.loss.backward()
     optimizer.step()
     optimizer.zero_grad()
 
-  """### Accuracy Check"""
+  """### Accuracy Check on Validation Set"""
   model.eval()
   matches = 0
-  
-  with torch.no_grad():
-    for i in range(len(val_df)):
-      output = model.generate(val_inputs[i].unsqueeze(0), max_length=28, prefix_allowed_tokens_fn=restrict_decode_vocab)
-      if decode(output[0]) == val_df['docid'].iloc[i]:
-        matches += 1
+  total = 0
 
-  val_acc = matches / float(len(val_df))
+  with torch.no_grad():
+    for i in range(0, len(val_inputs), EVAL_BATCH_SIZE):
+      batch_val_inputs = val_inputs[i:i+EVAL_BATCH_SIZE]
+      batch_val_labels = [val_df['docid'].iloc[j] for j in range(i, min(i + EVAL_BATCH_SIZE, len(val_inputs)))]
+      outputs = model.generate(batch_val_inputs, max_length=8, 
+                              prefix_allowed_tokens_fn=restrict_decode_vocab)
+      predictions = [decode(output) for output in outputs]
+      matches += sum([1 for pred, label in zip(predictions, batch_val_labels) if pred == label])
+      total += len(batch_val_inputs)
+
+  val_acc = matches / total
   wandb.log({"acc": val_acc})
 
   early_stopping(val_acc, epoch, model)
@@ -99,23 +105,28 @@ wandb.run.summary["best_val_acc"] = early_stopping.best_score
 
 """## Accuracy on Unseen Queries"""
 data = []
-
 model.eval()
 with torch.no_grad():
-
-  for i in range(len(test_df)):
-    output = model.generate(test_inputs[i].unsqueeze(0),
-          do_sample=False, return_dict_in_generate=True, output_scores=True,
-          max_length=28, num_beams=10, num_return_sequences=10,
-          prefix_allowed_tokens_fn=restrict_decode_vocab)
-
+  for i in range(0, len(test_df), EVAL_BATCH_SIZE):
+    batch_test_inputs = test_inputs[i:i+EVAL_BATCH_SIZE]
+    batch_test_df = test_df[i:i+EVAL_BATCH_SIZE]
+    output = model.generate(batch_test_inputs, 
+                  do_sample=False, 
+                  return_dict_in_generate=True, 
+                  output_scores=True,
+                  max_length=8,
+                  prefix_allowed_tokens_fn=restrict_decode_vocab, 
+                  num_beams=10, 
+                  num_return_sequences=10)
+    
     docids = [decode(output_id) for output_id in output.sequences]
     scores = output.sequences_scores.cpu().detach().numpy()
 
-    for docid, score in zip(docids, scores):
-      data.append([test_df['query'].iloc[i], test_df['docid'].iloc[i], docid, score])
+    for j, results in enumerate(batched(zip(docids, scores), 10)):
+      for docid, score in results:
+        data.append([test_df['query'].iloc[i+j], test_df['docid'].iloc[i+j], docid, score])
 
-
+            
 # Create results as table artifact
 table_name = f'retrieval_test_{N_DOCIDS}_{N_QUERIES}'
 artifact = wandb.Artifact(name=table_name, type='results')
