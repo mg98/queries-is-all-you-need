@@ -1,178 +1,132 @@
-import sys
 import os
 import pandas as pd
-from sklearn.model_selection import train_test_split
 import torch
 import wandb
-from util import *
+from transformers import T5Tokenizer
+from .trainer import Trainer
+from .util import *
 
-"""## Configuration"""
-N_DOCIDS   = int(sys.argv[1])
-N_QUERIES = int(sys.argv[2])
 TRAIN_SPLIT_SIZE = 3
 VAL_SPLIT_SIZE = 1
 TEST_SPLIT_SIZE = 1
 
-"""## Load and Prepare Dataset"""
-df = get_data(N_DOCIDS, (TRAIN_SPLIT_SIZE+VAL_SPLIT_SIZE+TEST_SPLIT_SIZE)*20)
+class Retrieval:
 
-train_base_df, val_df, test_df = train_test_val_split(
-  df,
-  TRAIN_SPLIT_SIZE*20*N_DOCIDS,
-  VAL_SPLIT_SIZE*20*N_DOCIDS,
-  TEST_SPLIT_SIZE*20*N_DOCIDS
-)
+  def __init__(self, cfg):
+    self.cfg = cfg
+    wandb.init(
+      project=f"{self.cfg.model}-{self.cfg.n_docs}-{self.cfg.docid_length}",
+      name=f"{self.cfg.n_queries}",
+      config={
+        "learning_rate": self.cfg.learning_rate,
+        "batch_size": self.cfg.batch_size,
+        "model": self.cfg.model,
+        "number_of_docs": self.cfg.n_docs,
+        "number_of_queries": self.cfg.n_queries,
+        "docid_length": self.cfg.docid_length,
+        "docid_repr": self.cfg.docid_repr,
+        "es_patience": self.cfg.es_patience,
+        "es_delta": self.cfg.es_delta,
+        "input_token_max_length": self.cfg.query_token_length,
+        "output_token_max_length": self.cfg.docid_token_length,
+        "output_max_length": self.cfg.output_max_length,
+        "num_workers": self.cfg.num_workers,
+        "train_split_size": TRAIN_SPLIT_SIZE,
+        "val_split_size": VAL_SPLIT_SIZE,
+        "test_split_size": TEST_SPLIT_SIZE,
+      })
+    wandb.Table.MAX_ARTIFACTS_ROWS = 2**31
+    wandb.define_metric("acc", summary="max")
+    wandb.define_metric("loss", summary="min")
+  
+  def __del__(self):
+    wandb.finish()
 
-"""## Split & Tokenization"""
-
-val_inputs, val_att = get_input_and_attention_masks(val_df['query'])
-test_inputs, _ = get_input_and_attention_masks(test_df['query'])
-
-# get a sample of n queries of each document for the train set
-train_df = pd.concat([group.head(N_QUERIES) for _, group in train_base_df.groupby('docid')])
-train_df = train_df.sample(frac=1).reset_index(drop=True)
-train_inputs, train_att = get_input_and_attention_masks(train_df['query'])
-train_labels, _ = get_input_and_attention_masks(train_df['docid'], True)
-
-"""## Training"""
-
-wandb.init(
-  project=f"retrieval-{N_DOCIDS}sx",
-  name=f"{N_QUERIES}",
-  config={
-   "learning_rate": LEARNING_RATE,
-   "train_batch_size": TRAIN_BATCH_SIZE,
-   "eval_batch_size": EVAL_BATCH_SIZE,
-   "model": MODEL_NAME,
-   "number_of_docs": N_DOCIDS,
-   "number_of_queries": N_QUERIES,
-   "es_patience": ES_PATIENCE,
-   "es_delta": ES_DELTA,
-   "train_split_size": TRAIN_SPLIT_SIZE,
-   "val_split_size": VAL_SPLIT_SIZE,
-   "test_split_size": TEST_SPLIT_SIZE,
-  }
-)
-wandb.define_metric("acc", summary="max")
-wandb.define_metric("loss", summary="min")
-
-early_stopping = EarlyStopping()
-model.train()
-
-epoch = 0
-while True:
-  epoch += 1
-
-  # training iteration
-  for i in range(0, len(train_inputs), TRAIN_BATCH_SIZE):
-    output = model(
-      input_ids=train_inputs[i:i+TRAIN_BATCH_SIZE],
-      attention_mask=train_att[i:i+TRAIN_BATCH_SIZE],
-      labels=train_labels[i:i+TRAIN_BATCH_SIZE]
+  def _get_datasets(self, df):
+    train_base_df, val_df, test_df = train_test_val_split(
+      df,
+      TRAIN_SPLIT_SIZE * self.cfg.max_queries * self.cfg.n_docs,
+      VAL_SPLIT_SIZE * self.cfg.max_queries * self.cfg.n_docs,
+      TEST_SPLIT_SIZE * self.cfg.max_queries * self.cfg.n_docs
     )
-    wandb.log({"loss": output.loss.item()})
-    output.loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
 
-  """### Accuracy Check on Validation Set"""
-  model.eval()
-  matches = 0
-  total = 0
+    # get a sample of n queries of each document for the train set
+    train_df = pd.concat([group.head(self.cfg.n_queries) for _, group in train_base_df.groupby('docid')])
+    train_df = train_df.sample(frac=1).reset_index(drop=True)
 
-  with torch.no_grad():
-    for i in range(0, len(val_inputs), EVAL_BATCH_SIZE):
-      batch_val_inputs = val_inputs[i:i+EVAL_BATCH_SIZE]
-      batch_val_labels = [val_df['docid'].iloc[j] for j in range(i, min(i + EVAL_BATCH_SIZE, len(val_inputs)))]
-      outputs = model.generate(batch_val_inputs, max_length=8, 
-                              prefix_allowed_tokens_fn=restrict_decode_vocab)
-      predictions = [decode(output) for output in outputs]
-      matches += sum([1 for pred, label in zip(predictions, batch_val_labels) if pred == label])
-      total += len(batch_val_inputs)
-
-  val_acc = matches / total
-  wandb.log({"acc": val_acc})
-
-  early_stopping(val_acc, epoch, model)
-  if early_stopping.early_stop:
-    model = early_stopping.best_model
-    print('set model to best_model and break', model is None)
-    break
-  model.train()
-
-wandb.run.summary["best_epoch"] = early_stopping.best_epoch
-wandb.run.summary["best_val_acc"] = early_stopping.best_score
-
-"""## Accuracy on Unseen Queries"""
-data = []
-model.eval()
-with torch.no_grad():
-  for i in range(0, len(test_df), EVAL_BATCH_SIZE):
-    batch_test_inputs = test_inputs[i:i+EVAL_BATCH_SIZE]
-    batch_test_df = test_df[i:i+EVAL_BATCH_SIZE]
-    output = model.generate(batch_test_inputs, 
-                  do_sample=False, 
-                  return_dict_in_generate=True, 
-                  output_scores=True,
-                  max_length=8,
-                  prefix_allowed_tokens_fn=restrict_decode_vocab, 
-                  num_beams=10, 
-                  num_return_sequences=10)
+    train_dataset = OrcasDataset(self.cfg, train_df)
+    val_dataset = OrcasDataset(self.cfg, val_df)
+    test_dataset = OrcasDataset(self.cfg, test_df)
     
-    docids = [decode(output_id) for output_id in output.sequences]
-    scores = output.sequences_scores.cpu().detach().numpy()
+    return train_dataset, val_dataset, test_dataset
+  
+  def _log_test_results(self, test_results):
+    table_name = f'retrieval_test_{self.cfg.n_docs}_{self.cfg.n_queries}'
+    artifact = wandb.Artifact(name=table_name, type='results')
+    artifact.add(
+      wandb.Table(columns=['test_input', 'test_output', 'output', 'score'], data=test_results),
+      table_name
+    )
+    wandb.run.log_artifact(artifact)
 
-    for j, results in enumerate(batched(zip(docids, scores), 10)):
-      for docid, score in results:
-        data.append([test_df['query'].iloc[i+j], test_df['docid'].iloc[i+j], docid, score])
+  def _log_summary(self, test_results):
+    df = pd.DataFrame(test_results, columns=['test_input', 'test_output', 'output', 'score'])
+    test_cases = df.groupby(['test_input', 'test_output'])
+    
+    for k in [1, 3, 5]:
+        acc = test_cases.apply(lambda group: (group['test_output'].iloc[0] == group.head(k)['output']).any()).sum()
+        wandb.run.summary[f'top{k}_acc'] = acc / float(test_cases.ngroups) if test_cases.ngroups > 0 else None
 
-            
-# Create results as table artifact
-table_name = f'retrieval_test_{N_DOCIDS}_{N_QUERIES}'
-artifact = wandb.Artifact(name=table_name, type='results')
-artifact.add(
-  wandb.Table(columns=['test_input', 'test_output', 'output', 'score'], data=data),
-  table_name
-)
-wandb.run.log_artifact(artifact)
+    try:
+        artifact = wandb.use_artifact(f'retrieval_summary:latest')
+        summary_table = artifact.get('retrieval_summary')
+    except wandb.errors.CommError:
+        summary_table = wandb.Table(columns=[
+          'n_docids', 'n_queries', 
+          'top1_acc', 'top3_acc', 'top5_acc'
+          ])
 
-# Compute top-k accuracies
-df = pd.DataFrame(data, columns=['test_input', 'test_output', 'output', 'score'])
-test_cases = df.groupby(['test_input', 'test_output'])
+    summary_table.add_data(
+      self.cfg.n_docs, 
+      self.cfg.n_queries, 
+      wandb.run.summary[f'top1_acc'], 
+      wandb.run.summary[f'top3_acc'], 
+      wandb.run.summary[f'top5_acc']
+    )
 
-for k in [1, 3, 5, 10]:
-    acc = test_cases.apply(lambda group: (group['test_output'].iloc[0] == group.head(k)['output']).any()).sum()
-    wandb.run.summary[f'top{k}_acc'] = acc / float(test_cases.ngroups)
+    artifact = wandb.Artifact('retrieval_summary', type='results')
+    artifact.add(summary_table, 'retrieval_summary')
+    wandb.log_artifact(artifact)
 
-try:
-    artifact = wandb.use_artifact(f'retrieval_summary:latest')
-    summary_table = artifact.get('retrieval_summary')
-except wandb.errors.CommError:
-    summary_table = wandb.Table(columns=[
-       'n_docids', 'n_queries', 
-       'top1_acc', 'top3_acc', 'top5_acc', 'top10_acc'
-      ])
+  def _log_model(self, model):
+    try:
+      model_path = f'model_{self.cfg.n_docs}_{self.cfg.n_queries}.pth'
+      torch.save(model.state_dict(), model_path)
+      artifact = wandb.Artifact(f'model_{self.cfg.n_docs}_{self.cfg.n_queries}', type='model')
+      artifact.add_file(model_path)
+      wandb.run.log_artifact(artifact)
+    finally:
+      if os.path.exists(model_path):
+        os.remove(model_path)
+  
+  def run(self):
+    df = get_data(
+      n_docs=self.cfg.n_docs, 
+      n_queries_per_docs=(TRAIN_SPLIT_SIZE+VAL_SPLIT_SIZE+TEST_SPLIT_SIZE)*self.cfg.max_queries, 
+      filter_from=self.cfg.min_pop, 
+      filter_to=self.cfg.max_pop
+      )
+    df['docid'] = df['docid'].apply(lambda docid: transform_docid(docid, self.cfg.docid_length, self.cfg.docid_repr))
+    
+    train_df, val_df, test_df = self._get_datasets(df)
+    
+    trainer = Trainer(self.cfg)
+    trainer.train(train_df, val_df)
+    del train_df, val_df
 
-summary_table.add_data(
-   N_DOCIDS, 
-   N_QUERIES, 
-   wandb.run.summary[f'top1_acc'], 
-   wandb.run.summary[f'top3_acc'], 
-   wandb.run.summary[f'top5_acc'], 
-   wandb.run.summary[f'top10_acc']
-)
+    test_results = trainer.test(test_df)
+    del test_df
 
-# Create or update the artifact with the new table
-artifact = wandb.Artifact('retrieval_summary', type='results')
-artifact.add(summary_table, 'retrieval_summary')
-wandb.log_artifact(artifact)
-
-# Store model state
-if not os.path.exists('models'): os.mkdir('models')
-model_path = f'models/model_{N_DOCIDS}_{N_QUERIES}.pth'
-torch.save(model.state_dict(), model_path)
-artifact = wandb.Artifact(f'model_{N_DOCIDS}_{N_QUERIES}', type='model')
-artifact.add_file(model_path)
-wandb.run.log_artifact(artifact)
-
-wandb.finish()
+    self._log_test_results(test_results)
+    self._log_summary(test_results)
+    self._log_model(trainer.model)

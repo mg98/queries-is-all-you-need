@@ -21,7 +21,7 @@ for X in range(1, 11):
 
     for docid in sampled_docids:
         queries = df[df['docid'] == docid].sample(n=10)['query'].tolist()
-        inputs = [tokenizer(query, return_tensors='pt').input_ids.to('cuda') for query in queries]
+        inputs = [tokenizer(query, return_tensors='pt').input_ids.to(device) for query in queries]
 
         with torch.no_grad():
             embeddings = torch.stack([model.encoder(input_ids=input_ids).last_hidden_state.mean(dim=1) for input_ids in inputs])

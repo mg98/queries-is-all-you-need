@@ -1,29 +1,12 @@
-from transformers import T5ForConditionalGeneration, T5Tokenizer
-import random
 import pandas as pd
-import numpy as np
-import torch
+import hashlib
+import base64
 from copy import deepcopy
 from sklearn.model_selection import train_test_split
-
-# Ensure deterministic behavior
-torch.backends.cudnn.deterministic = True
-torch.manual_seed(0)
-torch.cuda.manual_seed_all(0)
-np.random.seed(0)
-random.seed(0)
-
-MODEL_NAME = 't5-small'
-LEARNING_RATE = 1e-3
-TRAIN_BATCH_SIZE  = 32
-EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE * 2
-
-# Early stopping
-ES_PATIENCE  = 20
-ES_DELTA     = 0.01
+from torch.utils.data import Dataset
 
 class EarlyStopping:
-  def __init__(self, patience=ES_PATIENCE, min_delta=ES_DELTA):
+  def __init__(self, patience, min_delta):
     self.patience = patience
     self.min_delta = min_delta
     self.counter = 0
@@ -42,57 +25,92 @@ class EarlyStopping:
         self.early_stop = True
     else:
       self.best_score = score
+      print('New best score:', score, 'at epoch', epoch)
       self.best_model = deepcopy(model)
       self.best_epoch = epoch
       self.counter = 0
 
+class OrcasDataset(Dataset):
+    def __init__(self, cfg, df):
+        self.cfg = cfg
+        self.df = df
 
-def get_input_and_attention_masks(d, is_label = False):
-  tokenized = tokenizer(d.astype(str).tolist(), padding='max_length', return_tensors="pt", truncation=True,
-                        max_length=8 if is_label else 128)
-  input_ids = tokenized['input_ids'].to('cuda')
-  attention_mask = tokenized['attention_mask'].to('cuda')
-  return input_ids, attention_mask
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        tokenized_query = self.cfg.tokenizer(self.df['query'].iloc[idx], 
+                                         padding='max_length', 
+                                         truncation=True, 
+                                         max_length=self.cfg.query_token_length, 
+                                         return_tensors="pt")
+        tokenized_docid = self.cfg.tokenizer(self.df['docid'].iloc[idx], 
+                                        padding='max_length', 
+                                        truncation=True, 
+                                        max_length=self.cfg.docid_token_length,
+                                        return_tensors="pt")
+        return {
+            'index': idx,
+            'input_ids': tokenized_query['input_ids'].squeeze(0),
+            'attention_mask': tokenized_query['attention_mask'].squeeze(0),
+            'labels': tokenized_docid['input_ids'].squeeze(0)
+        }
   
-def decode(x):
- return tokenizer.decode(x, skip_special_tokens=True)
+# INT_TOKEN_IDS = None
+# def restrict_decode_vocab(batch_idx, prefix_beam):
+#   return INT_TOKEN_IDS
 
-# Precompute dataframes
-DF = pd.read_csv('orcas.tsv', sep='\t', header=None,
-        names=['query', 'docid'])
-DOCID_COUNTS = DF.groupby('docid').count()
+def transform_docid(docid, length: int, repr: str):
+  """
+  Transforms a document ID based on the specified length and representation.
 
-tokenizer = T5Tokenizer.from_pretrained(MODEL_NAME, legacy=True)
+  Args:
+    docid (str): The document ID to transform.
+    length (int): The desired length of the transformed ID. If set to 0, original ID is returned.
+    repr (str): The representation type of the transformed ID. Valid options are 'hex' and 'num'.
 
-tokenized_docids = DF['docid'].apply(tokenizer.tokenize)
-unique_tokens = set([token for sublist in tokenized_docids for token in sublist])
-INT_TOKEN_IDS = [id for token, id in tokenizer.get_vocab().items() if token in unique_tokens]
-INT_TOKEN_IDS.append(tokenizer.eos_token_id)
-MAX_NEW_TOKENS = max(len(tokens) for tokens in unique_tokens)
-del tokenized_docids, unique_tokens
+  Returns:
+    str: The transformed document ID.
 
-def restrict_decode_vocab(batch_idx, prefix_beam):
-    return INT_TOKEN_IDS
+  Raises:
+    ValueError: If an invalid representation type is provided.
+  """
+  if length is None:
+    return docid
+  
+  h = hashlib.sha1(docid.encode())
 
-model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME).to('cuda')
+  if repr == 'hex':
+    return h.hexdigest()[-length:]
+  elif repr == 'num':
+    n = int(h.hexdigest()[-length:], 16) % 10**length
+    return str(n).zfill(length)
+  elif repr == 'base64':
+    return base64.b64encode(h.digest()).decode('ascii')[-length:]
+  elif repr == 'bin':
+    return bin(int(h.hexdigest()[-length:], 16))[2:]
+  else:
+    raise ValueError('Invalid representation')
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
 def get_data(n_docs, n_queries_per_docs, filter_from=None, filter_to=None):
   """
   Get data (query-docid pairs) about `n_docs` documents and `n_queries_per_docs` associated queries per document.
   Only draw from documents that generally have between `filter_from` and `filter_to` queries linked to them.
   """
+  DF = pd.read_csv('orcas.tsv', sep='\t', header=None, names=['query', 'docid'])
+  docid_counts = DF.groupby('docid').count()
+
   if filter_from is None:
     filter_from = n_queries_per_docs
   elif filter_from < n_queries_per_docs:
     raise Exception('filter_from cannot be smaller than n_queries_per_docs')
 
-  condition = (DOCID_COUNTS['query'] >= filter_from)
+  condition = (docid_counts['query'] >= filter_from)
   if filter_to is not None:
-    condition &= (DOCID_COUNTS['query'] < filter_to)
+    condition &= (docid_counts['query'] < filter_to)
 
-  eligible_docids = DOCID_COUNTS[condition].index
+  eligible_docids = docid_counts[condition].index
   df = DF[DF['docid'].isin(eligible_docids)]
   sampled_docids = df['docid'].drop_duplicates().sample(n=n_docs)
 
@@ -102,6 +120,15 @@ def get_data(n_docs, n_queries_per_docs, filter_from=None, filter_to=None):
     base_df = pd.concat([base_df, docid_df])
   base_df.reset_index(drop=True, inplace=True)
 
+  # if DOCID_CHAR_LENGTH > 0:
+  #   base_df['docid'] = base_df['docid'].apply(transform_docid)
+
+  # tokenized_docids = base_df['docid'].drop_duplicates().apply(tokenizer.tokenize)
+  # unique_tokens = set([token for sublist in tokenized_docids for token in sublist])
+  # INT_TOKEN_IDS = [id for token, id in tokenizer.get_vocab().items() if token in unique_tokens]
+  # INT_TOKEN_IDS.append(tokenizer.eos_token_id)
+  # MAX_NEW_TOKENS = max(len(tokens) for tokens in unique_tokens)
+  
   return base_df
 
 def train_test_val_split(df, train_size, val_size, test_size):
